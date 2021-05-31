@@ -50,7 +50,6 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
   protected String username;
   protected String password;
   protected ReadPreference readPreference;
-  protected boolean autoConnectRetry;
   protected int socketTimeout;
   protected boolean useSSL;
 
@@ -72,7 +71,6 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     password = getOptionalStringConfig("password", null);
     readPreference = ReadPreference.valueOf(getOptionalStringConfig("read_preference", "primary"));
     int poolSize = getOptionalIntConfig("pool_size", 10);
-    autoConnectRetry = getOptionalBooleanConfig("auto_connect_retry", true);
     socketTimeout = getOptionalIntConfig("socket_timeout", 60000);
     useSSL = getOptionalBooleanConfig("use_ssl", false);
     useMongoTypes = getOptionalBooleanConfig("use_mongo_types", false);
@@ -82,7 +80,6 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     try {
       MongoClientOptions.Builder builder = new MongoClientOptions.Builder();
       builder.connectionsPerHost(poolSize);
-      builder.autoConnectRetry(autoConnectRetry);
       builder.socketTimeout(socketTimeout);
       builder.readPreference(readPreference);
 
@@ -220,9 +217,8 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     if (writeConcern == null) {
       writeConcern = db.getWriteConcern();
     }
-
-    WriteResult res = coll.save(obj, writeConcern);
-    if (res.getError() == null) {
+    try {
+      WriteResult res = coll.save(obj, writeConcern);
       if (genID != null) {
         JsonObject reply = new JsonObject();
         reply.put("_id", genID);
@@ -230,8 +226,8 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
       } else {
         sendOK(message);
       }
-    } else {
-      sendError(message, res.getError());
+    } catch (Exception e){
+      sendError(message, e.getMessage());
     }
   }
 
@@ -269,16 +265,16 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
       writeConcern = db.getWriteConcern();
     }
     writeConcern = WriteConcern.SAFE;
-    WriteResult res = coll.insert(dbos, writeConcern);
-    if (res.getError() == null) {
+    try {
+      WriteResult res = coll.insert(dbos, writeConcern);
       JsonObject reply = new JsonObject();
       reply.put("number", res.getN());
       if (genID != null) {
         reply.put("_id", genID);
       }
       sendOK(message, reply);
-    } else {
-      sendError(message, res.getError());
+    } catch (Exception e){
+      sendError(message, e.getMessage());
     }
   }
 
@@ -319,13 +315,13 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     if (writeConcern == null) {
       writeConcern = db.getWriteConcern();
     }
-    WriteResult res = coll.update(criteria, objNew, upsert, multi, writeConcern);
-    if (res.getError() == null) {
+    try {
+      WriteResult res = coll.update(criteria, objNew, upsert, multi, writeConcern);
       JsonObject reply = new JsonObject();
       reply.put("number", res.getN());
       sendOK(message, reply);
-    } else {
-      sendError(message, res.getError());
+    } catch (Exception e){
+      sendError(message, e.getMessage());
     }
   }
 
@@ -520,13 +516,17 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
 				String f = (String) attr;
 				Object tmp = res.get(f);
 				if (tmp == null || !(tmp instanceof DBRef)) continue;
-				res.put(f, ((DBRef) tmp).fetch());
+				res.put(f, fetchRef((DBRef) tmp));
 			}
 		}
       JsonObject m = dbObjectToJsonObject(res);
       reply.put("result", m);
     }
     sendOK(message, reply);
+  }
+
+  private DBObject fetchRef(final DBRef ref){
+    return db.getCollection(ref.getCollectionName()).findOne(ref.getId());
   }
 
   private void doFindAndModify(Message<JsonObject> message) {
