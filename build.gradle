@@ -59,6 +59,7 @@ dependencies {
 }
 
 jar {
+  sourceSets.main.resources.srcDirs += [ "deployment" ]
   manifest {
     attributes(
         "Main-Verticle": "service:mod"
@@ -68,10 +69,10 @@ jar {
 
 shadowJar {
   classifier = 'fat'
-    archiveName = "${modowner}~${modname}~$version-$classifier.$extension"
-    mergeServiceFiles {
-      include 'META-INF/services/io.vertx.core.spi.VerticleFactory'
-    }
+  archiveName = "${modowner}~${modname}~$version-$classifier.$extension"
+  mergeServiceFiles {
+    include 'META-INF/services/io.vertx.core.spi.VerticleFactory'
+  }
 }
 
 publishing {

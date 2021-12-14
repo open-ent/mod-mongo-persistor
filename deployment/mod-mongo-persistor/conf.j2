@@ -1,0 +1,41 @@
+{
+    "name": "{{ modMongoPersistorVersion }}",
+    "priority": 1,
+    "waitDeploy" : true,
+    "worker": true,
+    "multi-threaded": true,
+    "config": {
+        {% if mongo_password is defined %}
+        "username": "{{ mongo_user }}",
+        "password": "{{ mongo_password }}",
+        "db_auth": "{{ dbName }}",
+        {% endif %}
+        "address": "wse.mongodb.persistor",
+        "seeds": [
+        {% if ipMongodb is defined %}
+            {% for ip in ipMongodb %}
+            {
+                "host": "{{ ip }}",
+                "port": 27017
+            }{% if not(loop.last) %},{% endif %}
+            {% endfor %}
+        {% else %}
+            {% for ip in dbip %}
+            {
+                "host": "{{ ip }}",
+                "port": 27017
+            }{% if not(loop.last) %},{% endif %}
+            {% endfor %}
+        {% endif %}
+        ],
+        "db_name": "{{ dbName }}",
+        "use_mongo_types": true,
+        {% if (readPreferenceMongo is defined and readPreferenceMongo) %}
+        "read_preference": "nearest",
+        {% endif %}
+		{% if socketTimeoutMongo is defined %}
+        "socket_timeout":{{socketTimeoutMongo}},
+        {% endif %}
+        "pool_size": 110
+    }
+}
