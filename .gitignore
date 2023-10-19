@@ -10,4 +10,8 @@ bin
 build
 out
 /mods
-gradle*
+gradle
+gradlew*
+.env
+dependency-reduced-pom.xml
+target

@@ -16,19 +16,20 @@
 
 package org.vertx.mods;
 
-import com.mongodb.*;
-
-import com.mongodb.client.model.DBCollectionUpdateOptions;
+import com.mongodb.ReadPreference;
+import io.vertx.codegen.annotations.Nullable;
+import io.vertx.core.Future;
 import io.vertx.core.Handler;
+import io.vertx.core.Promise;
 import io.vertx.core.eventbus.Message;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
-import org.apache.commons.lang3.StringUtils;
+import io.vertx.core.streams.ReadStream;
+import io.vertx.ext.mongo.*;
 import org.vertx.java.busmods.BusModBase;
 
-import javax.net.ssl.SSLSocketFactory;
-import java.net.UnknownHostException;
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * MongoDB Persistor Bus Module<p>
@@ -43,77 +44,20 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
   protected String address;
   protected String host;
   protected int port;
-  protected String dbName;
-  protected String dbAuth;
   protected String username;
   protected String password;
   protected ReadPreference readPreference;
-  protected int socketTimeout;
-  protected boolean useSSL;
 
-  protected Mongo mongo;
-  protected DB db;
-  private boolean useMongoTypes;
+  protected MongoClient mongo;
+  private WriteOption writeOption = WriteOption.ACKNOWLEDGED;
 
   @Override
   public void start() {
     super.start();
 
     address = getOptionalStringConfig("address", "vertx.mongopersistor");
-
-    host = getOptionalStringConfig("host", "localhost");
-    port = getOptionalIntConfig("port", 27017);
-    dbName = getOptionalStringConfig("db_name", "default_db");
-    dbAuth = getOptionalStringConfig("db_auth", "default_db");
-    username = getOptionalStringConfig("username", null);
-    password = getOptionalStringConfig("password", null);
-    readPreference = ReadPreference.valueOf(getOptionalStringConfig("read_preference", "primary"));
-    int poolSize = getOptionalIntConfig("pool_size", 10);
-    socketTimeout = getOptionalIntConfig("socket_timeout", 60000);
-    useSSL = getOptionalBooleanConfig("use_ssl", false);
-    useMongoTypes = getOptionalBooleanConfig("use_mongo_types", false);
-
-    JsonArray seedsProperty = config.getJsonArray("seeds");
-
-    try {
-      MongoClientOptions.Builder builder = new MongoClientOptions.Builder();
-      builder.connectionsPerHost(poolSize);
-      builder.socketTimeout(socketTimeout);
-      builder.readPreference(readPreference);
-
-      if (useSSL) {
-        builder.socketFactory(SSLSocketFactory.getDefault());
-      }
-
-      final List<MongoCredential> credentials = new ArrayList<>();
-      if (username != null && password != null && dbAuth != null) {
-        credentials.add(MongoCredential.createScramSha1Credential(username, dbAuth, password.toCharArray()));
-      }
-
-      if (seedsProperty == null) {
-        ServerAddress address = new ServerAddress(host, port);
-        mongo = new MongoClient(address, credentials, builder.build());
-      } else {
-        List<ServerAddress> seeds = makeSeeds(seedsProperty);
-        mongo = new MongoClient(seeds, credentials, builder.build());
-      }
-
-      db = mongo.getDB(dbName);
-    } catch (UnknownHostException e) {
-      logger.error("Failed to connect to mongo server", e);
-    }
+    this.mongo = MongoClient.createShared(vertx, config);
     eb.consumer(address, this);
-  }
-
-  private List<ServerAddress> makeSeeds(JsonArray seedsProperty) throws UnknownHostException {
-    List<ServerAddress> seeds = new ArrayList<>();
-    for (Object elem : seedsProperty) {
-      JsonObject address = (JsonObject) elem;
-      String host = address.getString("host");
-      int port = address.getInteger("port");
-      seeds.add(new ServerAddress(host, port));
-    }
-    return seeds;
   }
 
   @Override
@@ -131,9 +75,7 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
       sendError(message, "action must be specified");
       return;
     }
-
     try {
-
       // Note actions should not be in camel case, but should use underscores
       // I have kept the version with camel case so as not to break compatibility
 
@@ -190,82 +132,87 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
         default:
           sendError(message, "Invalid action: " + action);
       }
-    } catch (MongoException e) {
+    } catch (Exception e) {
       sendError(message, e.getMessage(), e);
     }
   }
 
-  private void doSave(Message<JsonObject> message) {
+  private Future<Void> doSave(Message<JsonObject> message) {
     String collection = getMandatoryString("collection", message);
     if (collection == null) {
-      return;
+      return Future.succeededFuture();
     }
     JsonObject doc = getMandatoryObject("document", message);
     if (doc == null) {
-      return;
+      return Future.succeededFuture();
     }
     String genID = generateId(doc);
-    DBCollection coll = db.getCollection(collection);
-    DBObject obj = jsonToDBObject(doc);
-    WriteConcern writeConcern = getWriteConcernWithPriority(message);
-    try {
-      WriteResult res = coll.save(obj, writeConcern);
+    return mongo.saveWithOptions(collection, doc, getWriteConcern())
+    .onSuccess(result -> {
       if (genID != null) {
-        JsonObject reply = new JsonObject();
-        reply.put("_id", genID);
+        JsonObject reply = new JsonObject().put("_id", genID);
         sendOK(message, reply);
       } else {
         sendOK(message);
       }
-    } catch (Exception e){
-      sendError(message, e.getMessage());
-    }
+    })
+    .onFailure(th -> sendError(message, th.getMessage(), th))
+    .mapEmpty();
   }
 
-  private void doInsert(Message<JsonObject> message) {
+  private @Nullable WriteOption getWriteConcern() {
+    return writeOption;
+  }
+  private @Nullable WriteOption getWriteConcern(final WriteOption defaultWriteConcern) {
+    Optional<String> writeConcern = getStringConfig("writeConcern");
+    if(!writeConcern.isPresent()) {
+      writeConcern = getStringConfig("write_concern");
+    }
+    return writeConcern.map(WriteOption::valueOf).orElse(defaultWriteConcern);
+  }
+
+  private Future<Void> doInsert(Message<JsonObject> message) {
     String collection = getMandatoryString("collection", message);
     if (collection == null) {
-      return;
+      return Future.succeededFuture();
     }
     boolean multipleDocuments = message.body().getBoolean("multiple", false);
 
-    List<DBObject> dbos = new ArrayList<>();
-    String genID = null;
+    List<BulkOperation> operations = new ArrayList<>();
+    final StringBuilder genID = new StringBuilder();
     if (multipleDocuments) {
       JsonArray documents = message.body().getJsonArray("documents");
       if (documents == null) {
-        return;
+        return Future.succeededFuture();
       }
       for (Object o : documents) {
         JsonObject doc = (JsonObject) o;
         generateId(doc);
-        dbos.add(jsonToDBObject(doc));
+        operations.add(BulkOperation.createInsert(doc));
       }
     } else {
       JsonObject doc = getMandatoryObject("document", message);
       if (doc == null) {
-        return;
+        return Future.succeededFuture();
       }
-      genID = generateId(doc);
-      dbos.add(jsonToDBObject(doc));
+      genID.append(generateId(doc));
+      operations.add(BulkOperation.createInsert(doc));
     }
-
-    DBCollection coll = db.getCollection(collection);
-    WriteConcern writeConcern = WriteConcern.valueOf(getOptionalStringConfig("write_concern",""));
-    if (writeConcern == null) {
-      writeConcern = db.getWriteConcern();
-    }
-    writeConcern = WriteConcern.SAFE;
     try {
-      WriteResult res = coll.insert(dbos, writeConcern);
-      JsonObject reply = new JsonObject();
-      reply.put("number", res.getN());
-      if (genID != null) {
-        reply.put("_id", genID);
-      }
-      sendOK(message, reply);
+      return mongo.bulkWriteWithOptions(collection, operations, new BulkWriteOptions().setWriteOption(WriteOption.ACKNOWLEDGED))
+        .onFailure(th -> sendError(message, th.getMessage(), th))
+        .onSuccess(res -> {
+          JsonObject reply = new JsonObject();
+          reply.put("number", res.getInserts().size());
+          if (genID.length() > 0) {
+            reply.put("_id", genID.toString());
+          }
+          sendOK(message, reply);
+        })
+        .mapEmpty();
     } catch (Exception e){
       sendError(message, e.getMessage());
+      return Future.failedFuture(e);
     }
   }
 
@@ -278,63 +225,57 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     return null;
   }
 
-  private void doUpdate(Message<JsonObject> message) {
+  private Future<Void> doUpdate(Message<JsonObject> message) {
     // mongo collection
     String collection = getMandatoryString("collection", message);
     if (collection == null) {
-      return;
+      return Future.succeededFuture();
     }
-    DBCollection coll = db.getCollection(collection);
 
     // query criteria
     JsonObject criteriaJson = getMandatoryObject("criteria", message);
     if (criteriaJson == null) {
-      return;
+      return Future.succeededFuture();
     }
-    DBObject criteria = jsonToDBObject(criteriaJson);
 
     // query arrayFilters (not mandatory)
-    final List<DBObject> arrayFiltersList = new ArrayList<>();
     JsonArray arrayFiltersJsonArray = message.body().getJsonArray("arrayFilters");
-    if (arrayFiltersJsonArray != null) {
-      arrayFiltersJsonArray.forEach(arrayFilter -> arrayFiltersList.add(jsonToDBObject((JsonObject) arrayFilter)));
-    }
 
     // new object for update
     JsonObject objNewJson = getMandatoryObject("objNew", message);
     if (objNewJson == null) {
-      return;
+      return Future.succeededFuture();
     }
-    DBObject objNew = jsonToDBObject(objNewJson);
-
-    try {
-      DBCollectionUpdateOptions updateOptions = new DBCollectionUpdateOptions()
-              .upsert(message.body().getBoolean("upsert", false))
-              .multi(message.body().getBoolean("multi", false))
-              .writeConcern(getWriteConcernWithPriority(message))
-              .arrayFilters(arrayFiltersList);
-      WriteResult res = coll.update(criteria, objNew, updateOptions);
-      JsonObject reply = new JsonObject();
-      reply.put("number", res.getN());
-      sendOK(message, reply);
-    } catch (Exception e){
-      sendError(message, e.getMessage());
-    }
+    final boolean upsert = message.body().getBoolean("upsert", false);
+    final boolean multi = message.body().getBoolean("multi", false);
+    final UpdateOptions options = new UpdateOptions()
+      .setUpsert(upsert)
+      .setWriteOption(getWriteConcern())
+      .setMulti(multi);
+	if (arrayFiltersJsonArray != null) {
+		options.setArrayFilters(arrayFiltersJsonArray);
+	}
+    return mongo.updateCollectionWithOptions(collection, criteriaJson, objNewJson, options)
+      .onSuccess(res -> {
+        JsonObject reply = new JsonObject();
+        reply.put("number", res.getDocModified());
+        sendOK(message, reply);
+      })
+      .onFailure(th -> sendError(message, th.getMessage(), th))
+      .mapEmpty();
   }
 
-  private void doBulk(Message<JsonObject> message) {
+  private Future<Void> doBulk(Message<JsonObject> message) {
     String collection = getMandatoryString("collection", message);
     if (collection == null) {
-      return;
+      return Future.succeededFuture();
     }
     JsonArray commands = message.body().getJsonArray("commands");
-    if (commands == null || commands.size() < 1) {
+    if (commands == null || commands.isEmpty()) {
       sendError(message, "Missing commands");
-      return;
+      return Future.failedFuture("mongodb.missing.commands");
     }
-    final String writeConcern  = message.body().getString("write_concern");
-    DBCollection coll = db.getCollection(collection);
-    BulkWriteOperation bulk = coll.initializeUnorderedBulkOperation();
+    final List<BulkOperation> bulk = new ArrayList<>();
     for (Object o: commands) {
       if (!(o instanceof JsonObject)) continue;
       JsonObject command = (JsonObject) o;
@@ -343,73 +284,70 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
       switch (command.getString("operation", "")) {
         case "insert" :
           if (d != null) {
-            bulk.insert(jsonToDBObject(d));
+            bulk.add(BulkOperation.createInsert(d));
           }
           break;
         case "update" :
           if (d != null && c != null) {
-            bulk.find(jsonToDBObject(c)).update(jsonToDBObject(d));
+            bulk.add(BulkOperation.createUpdate(c, d));
           }
           break;
         case "updateOne":
           if (d != null) {
-            bulk.find(jsonToDBObject(c)).updateOne(jsonToDBObject(d));
+            bulk.add(BulkOperation.createUpdate(c, d, false, false));
           }
           break;
         case "upsert" :
           if (d != null) {
-            bulk.find(jsonToDBObject(c)).upsert().updateOne(jsonToDBObject(d));
+            bulk.add(BulkOperation.createUpdate(c, d, true, true));
           }
           break;
         case "upsertOne":
           if (d != null && c != null) {
-            bulk.find(jsonToDBObject(c)).upsert().updateOne(jsonToDBObject(d));
+            bulk.add(BulkOperation.createUpdate(c, d, true, false));
           }
           break;
         case "remove":
           if (c != null) {
-            bulk.find(jsonToDBObject(c)).remove();
+            bulk.add(BulkOperation.createDelete(c));
           }
           break;
         case "removeOne":
           if (c != null) {
-            bulk.find(jsonToDBObject(c)).removeOne();
+            bulk.add(BulkOperation.createDelete(c).setMulti(false));
           }
           break;
       }
     }
-    final BulkWriteResult r;
-    if (writeConcern != null && !writeConcern.isEmpty()) {
-      r = bulk.execute(WriteConcern.valueOf(writeConcern));
-    } else {
-      r = bulk.execute();
-    }
-    sendOK(message, new JsonObject()
-                    .put("inserted", r.getInsertedCount())
-                    .put("matched", r.getMatchedCount())
-                    .put("modified", r.getModifiedCount())
-                    .put("removed", r.getRemovedCount())
-    );
+    return mongo.bulkWriteWithOptions(collection, bulk, new BulkWriteOptions().setWriteOption(getWriteConcern()))
+      .onSuccess(res -> sendOK(message, new JsonObject()
+        .put("inserted", res.getInsertedCount())
+        .put("matched", res.getMatchedCount())
+        .put("modified", res.getModifiedCount())
+        .put("removed", res.getDeletedCount())
+      ))
+      .onFailure(th -> sendError(message, th.getMessage(), th))
+      .mapEmpty();
   }
 
-  private void doFind(Message<JsonObject> message) {
+  private Future<Void> doFind(Message<JsonObject> message) {
     String collection = getMandatoryString("collection", message);
     if (collection == null) {
-      return;
+      return Future.succeededFuture();
     }
-    Integer limit = (Integer) message.body().getInteger("limit");
+    Integer limit = message.body().getInteger("limit");
     if (limit == null) {
       limit = -1;
     }
-    Integer skip = (Integer) message.body().getInteger("skip");
+    Integer skip = message.body().getInteger("skip");
     if (skip == null) {
       skip = -1;
     }
-    Integer batchSize = (Integer) message.body().getInteger("batch_size");
+    Integer batchSize = message.body().getInteger("batch_size");
     if (batchSize == null) {
       batchSize = 100;
     }
-    Integer timeout = (Integer) message.body().getInteger("timeout");
+    Integer timeout = message.body().getInteger("timeout");
     if (timeout == null || timeout < 0) {
       timeout = 10000; // 10 seconds
     }
@@ -418,77 +356,37 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
 
     Object hint = message.body().getValue("hint");
     Object sort = message.body().getValue("sort");
-    DBCollection coll = db.getCollection(collection);
-    // add read preference
-    final String overrideReadPreference = message.body().getString("read_preference");
-    if(overrideReadPreference != null){
-      coll.setReadPreference(ReadPreference.valueOf(overrideReadPreference));
-    }
     // call find
-    DBCursor cursor;
-    if (matcher != null) {
-      cursor = (keys == null) ?
-          coll.find(jsonToDBObject(matcher)) :
-          coll.find(jsonToDBObject(matcher), jsonToDBObject(keys));
-    } else {
-      cursor = coll.find();
+    final FindOptions options = new FindOptions();
+    if (matcher != null && keys != null) {
+      options.setFields(keys);
     }
     if (skip != -1) {
-      cursor.skip(skip);
+      options.setSkip(skip);
     }
     if (limit != -1) {
-      cursor.limit(limit);
+      options.setLimit(limit);
     }
     if (sort != null) {
-      cursor.sort(sortObjectToDBObject(sort));
+      options.setSort((JsonObject) sort);
     }
     if (hint != null) {
       if (hint instanceof JsonObject) {
-        cursor.hint(jsonToDBObject((JsonObject) hint));
+        options.setHint((JsonObject) hint);
       } else if (hint instanceof String) {
-        cursor.hint((String) hint);
+        options.setHintString((String) hint);
       } else {
-        throw new IllegalArgumentException("Cannot handle type " + hint.getClass().getSimpleName());
+        return Future.failedFuture("Cannot handle type " + hint.getClass().getSimpleName());
       }
     }
-    sendBatch(message, cursor, batchSize, timeout);
+
+    return mongo.findWithOptions(collection, matcher == null ? new JsonObject() : matcher, options)
+      .onFailure(th -> sendError(message, th.getMessage(), th))
+      .onSuccess(results -> message.reply(createBatchMessage("ok", results)))
+      .mapEmpty();
   }
 
-  private DBObject sortObjectToDBObject(Object sortObj) {
-    if (sortObj instanceof JsonObject) {
-      // Backwards compatability and a simpler syntax for single-property sorting
-      return jsonToDBObject((JsonObject) sortObj);
-    } else if (sortObj instanceof JsonArray) {
-      JsonArray sortJsonObjects = (JsonArray) sortObj;
-      DBObject sortDBObject = new BasicDBObject();
-      for (Object curSortObj : sortJsonObjects) {
-        if (!(curSortObj instanceof JsonObject)) {
-          throw new IllegalArgumentException("Cannot handle type "
-              + curSortObj.getClass().getSimpleName());
-        }
-
-        sortDBObject.putAll(((JsonObject) curSortObj).getMap());
-      }
-
-      return sortDBObject;
-    } else {
-      throw new IllegalArgumentException("Cannot handle type " + sortObj.getClass().getSimpleName());
-    }
-  }
-
-  private void sendBatch(Message<JsonObject> message, final DBCursor cursor, final int max, final int timeout) {
-    JsonArray results = new JsonArray();
-    while (cursor.hasNext()) {
-      DBObject obj = cursor.next();
-      JsonObject m = dbObjectToJsonObject(obj);
-      results.add(m);
-    }
-    JsonObject reply = createBatchMessage("ok", results);
-    message.reply(reply);
-    cursor.close();
-  }
-
-  private JsonObject createBatchMessage(String status, JsonArray results) {
+  private JsonObject createBatchMessage(String status, final List<?> results) {
     JsonObject reply = new JsonObject();
     reply.put("results", results);
     reply.put("status", status);
@@ -496,249 +394,222 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     return reply;
   }
 
-  private void doFindOne(Message<JsonObject> message) {
+  private Future<Void> doFindOne(Message<JsonObject> message) {
     String collection = getMandatoryString("collection", message);
     if (collection == null) {
-      return;
+      return Future.failedFuture("collection.name.mandatory");
     }
     JsonObject matcher = message.body().getJsonObject("matcher");
     JsonObject keys = message.body().getJsonObject("keys");
-    DBCollection coll = db.getCollection(collection);
-    // add read preference
-    final String overrideReadPreference = message.body().getString("read_preference");
-    if(overrideReadPreference != null){
-      coll.setReadPreference(ReadPreference.valueOf(overrideReadPreference));
-    }
-    // call find
-    DBObject res;
-    if (matcher == null) {
-      res = keys != null ? coll.findOne(null, jsonToDBObject(keys)) : coll.findOne();
-    } else {
-      res = keys != null ? coll.findOne(jsonToDBObject(matcher), jsonToDBObject(keys)) : coll.findOne(jsonToDBObject(matcher));
-    }
-    JsonObject reply = new JsonObject();
-	JsonArray fetch = message.body().getJsonArray("fetch");
-	if (res != null) {
-		if (fetch != null) {
-			for (Object attr : fetch) {
-				if (!(attr instanceof String)) continue;
-				String f = (String) attr;
-				Object tmp = res.get(f);
-				if (tmp == null || !(tmp instanceof DBRef)) continue;
-				res.put(f, fetchRef((DBRef) tmp));
-			}
-		}
-      JsonObject m = dbObjectToJsonObject(res);
-      reply.put("result", m);
-    }
-    sendOK(message, reply);
+    return mongo.findOne(collection, matcher == null ? new JsonObject() : matcher, keys)
+      .onFailure(th -> sendError(message, th.getMessage(), th))
+      .compose(res -> {
+        final Promise<JsonObject> replyPromise = Promise.promise();
+        JsonObject reply = new JsonObject();
+        if (res == null) {
+          replyPromise.complete(reply);
+        } else {
+          reply.put("result", res);
+          JsonArray fetch = message.body().getJsonArray("fetch");
+          if (fetch == null) {
+            replyPromise.complete(reply);
+          } else {
+            List<Future<?>> fetches = fetch.stream().map(attr -> {
+              if (attr instanceof String) {
+                String f = (String) attr;
+                JsonObject tmp = res.getJsonObject(f);
+                final Future<Void> onDbRefFetched;
+                if (tmp == null || !(tmp.containsKey("$ref"))) {
+                  onDbRefFetched = Future.succeededFuture();
+                } else {
+                  onDbRefFetched = fetchRef(tmp)
+                    .onSuccess(fetched -> res.put(f, fetched))
+                    .mapEmpty();
+                }
+                return onDbRefFetched;
+              } else {
+                return Future.succeededFuture(null);
+              }
+            }).collect(Collectors.toList());
+            reply.put("result", res);
+            Future.join(fetches).onSuccess(e -> replyPromise.complete(reply)).onFailure(replyPromise::fail);
+          }
+        }
+        return replyPromise.future();
+      })
+      .onSuccess(reply -> sendOK(message, reply))
+      .mapEmpty();
   }
 
-  private DBObject fetchRef(final DBRef ref){
-    return db.getCollection(ref.getCollectionName()).findOne(ref.getId());
+  private Future<JsonObject> fetchRef(final JsonObject ref){
+    final JsonObject query = new JsonObject().put("_id", ref.getString("$id"));
+    return mongo.findOne(ref.getString("$ref"), query, null);
   }
 
-  private void doFindAndModify(Message<JsonObject> message) {
+  private Future<Void> doFindAndModify(Message<JsonObject> message) {
     String collectionName = getMandatoryString("collection", message);
     if (collectionName == null) {
-      return;
+      return Future.failedFuture("collection.name.mandatory");
     }
-    JsonObject msgBody = message.body();
-    DBObject update = jsonToDBObjectNullSafe(msgBody.getJsonObject("update"));
-    DBObject query = jsonToDBObjectNullSafe(msgBody.getJsonObject("matcher"));
-    DBObject sort = jsonToDBObjectNullSafe(msgBody.getJsonObject("sort"));
-    DBObject fields = jsonToDBObjectNullSafe(msgBody.getJsonObject("fields"));
-    boolean remove = msgBody.getBoolean("remove", false);
+    final JsonObject msgBody = message.body();
+    final JsonObject update = msgBody.getJsonObject("update");
+    final JsonObject query = msgBody.getJsonObject("matcher");
+    final JsonObject sort = msgBody.getJsonObject("sort");
+    final JsonObject fields = msgBody.getJsonObject("fields");
+    final FindOptions findOptions = new FindOptions().setSort(sort).setFields(fields);
     boolean returnNew = msgBody.getBoolean("new", false);
     boolean upsert = msgBody.getBoolean("upsert", false);
+    final UpdateOptions updateOptions = new UpdateOptions()
+      .setReturningNewDocument(returnNew)
+      .setUpsert(upsert);
+    boolean remove = msgBody.getBoolean("remove", false);
 
-    DBCollection collection = db.getCollection(collectionName);
-    DBObject result = collection.findAndModify(query, fields, sort, remove,
-      update, returnNew, upsert);
-
-    JsonObject reply = new JsonObject();
-    if (result != null) {
-      JsonObject resultJson = dbObjectToJsonObject(result);
-      reply.put("result", resultJson);
+    if (remove) {
+      return mongo.findOneAndDeleteWithOptions(collectionName, query, findOptions)
+              .onFailure(th -> sendError(message, th.getMessage(), th))
+              .onSuccess(res -> {
+                final JsonObject reply = new JsonObject();
+                if (res != null) {
+                  reply.put("result", res);
+                }
+                sendOK(message, reply);
+              })
+              .mapEmpty();
+    } else {
+      return mongo.findOneAndUpdateWithOptions(collectionName, query, update, findOptions, updateOptions)
+              .onFailure(th -> sendError(message, th.getMessage(), th))
+              .onSuccess(res -> {
+                final JsonObject reply = new JsonObject();
+                if (res != null) {
+                  reply.put("result", res);
+                }
+                sendOK(message, reply);
+              })
+              .mapEmpty();
     }
-    sendOK(message, reply);
   }
 
-  private void doCount(Message<JsonObject> message) {
+  private Future<Void> doCount(Message<JsonObject> message) {
     String collection = getMandatoryString("collection", message);
     if (collection == null) {
-      return;
+      return Future.failedFuture("collection.name.mandatory");
     }
-    JsonObject matcher = message.body().getJsonObject("matcher");
-    DBCollection coll = db.getCollection(collection);
-    // add read preference
-    final String overrideReadPreference = message.body().getString("read_preference");
-    if(overrideReadPreference != null){
-      coll.setReadPreference(ReadPreference.valueOf(overrideReadPreference));
-    }
+    final JsonObject matcher = message.body().getJsonObject("matcher");
+
     // call find
-    long count;
-    if (matcher == null) {
-      count = coll.count();
-    } else {
-      count = coll.count(jsonToDBObject(matcher));
-    }
-    JsonObject reply = new JsonObject();
-    reply.put("count", count);
-    sendOK(message, reply);
+    return mongo.count(collection, matcher == null ? new JsonObject() : matcher)
+      .onFailure(th -> sendError(message, th.getMessage(), th))
+      .onSuccess(count -> {
+        JsonObject reply = new JsonObject();
+        reply.put("count", count);
+        sendOK(message, reply);
+      })
+      .mapEmpty();
   }
 
   @SuppressWarnings({ "rawtypes", "unchecked" })
-  private void doDistinct(Message<JsonObject> message) {
+  private Future<Void> doDistinct(Message<JsonObject> message) {
     String collection = getMandatoryString("collection", message);
     if (collection == null) {
-      return;
+      return Future.failedFuture("collection.name.mandatory");
     }
-    String key = getMandatoryString("key", message);
+    final String key = getMandatoryString("key", message);
     if (key == null) {
-      return;
+      return Future.failedFuture("collection.key.mandatory");
     }
-    JsonObject matcher = message.body().getJsonObject("matcher");
-    DBCollection coll = db.getCollection(collection);
-	List values;
-    if (matcher == null) {
-      values = coll.distinct(key);
+    final JsonObject matcher = message.body().getJsonObject("matcher");
+    final Future<JsonArray> future;
+    if(matcher == null) {
+      future = mongo.distinct(collection, key, String.class.getName());
     } else {
-      values = coll.distinct(key, jsonToDBObject(matcher));
+      future = mongo.distinctWithQuery(collection, key, String.class.getName(), matcher);
     }
-    JsonObject reply = new JsonObject();
-    reply.put("values", new JsonArray(values));
-    sendOK(message, reply);
+    return future.
+      onFailure(th -> sendError(message, th.getMessage(), th))
+      .onSuccess(values -> {
+        JsonObject reply = new JsonObject().put("values", values);
+        sendOK(message, reply);
+      })
+      .mapEmpty();
   }
 
-  private void doDelete(Message<JsonObject> message) {
+  private Future<Void> doDelete(Message<JsonObject> message) {
     String collection = getMandatoryString("collection", message);
     if (collection == null) {
-      return;
+      return Future.failedFuture("collection.name.mandatory");
     }
     JsonObject matcher = getMandatoryObject("matcher", message);
     if (matcher == null) {
-      return;
+      return Future.failedFuture("matcher.mandatory");
     }
-    DBCollection coll = db.getCollection(collection);
-    DBObject obj = jsonToDBObject(matcher);
-    WriteConcern writeConcern = getWriteConcernWithPriority(message);
-    WriteResult res = coll.remove(obj, writeConcern);
-    int deleted = res.getN();
-    JsonObject reply = new JsonObject().put("number", deleted);
-    sendOK(message, reply);
+    return mongo.removeDocumentsWithOptions(collection, matcher, getWriteConcern())
+      .onFailure(th -> sendError(message, th.getMessage(), th))
+      .onSuccess(res -> {
+        JsonObject reply = new JsonObject().put("number", res.getRemovedCount());
+        sendOK(message, reply);
+      })
+      .mapEmpty();
   }
 
-  private void getCollections(Message<JsonObject> message) {
-    JsonObject reply = new JsonObject();
-    reply.put("collections", new JsonArray(new ArrayList<>(db.getCollectionNames())));
-    sendOK(message, reply);
+  private Future<Void> getCollections(Message<JsonObject> message) {
+    return mongo.getCollections()
+      .onFailure(th -> sendError(message, th.getMessage(), th))
+      .onSuccess(colls -> {
+        final JsonObject reply = new JsonObject().put("collections", new JsonArray(colls));
+        sendOK(message, reply);
+      })
+      .mapEmpty();
   }
 
-  private void dropCollection(Message<JsonObject> message) {
-
-    JsonObject reply = new JsonObject();
+  private Future<Void> dropCollection(Message<JsonObject> message) {
     String collection = getMandatoryString("collection", message);
-
     if (collection == null) {
-      return;
+      return Future.failedFuture("collection.name.mandatory");
     }
-
-    DBCollection coll = db.getCollection(collection);
-
-    try {
-      coll.drop();
-      sendOK(message, reply);
-    } catch (MongoException mongoException) {
-      sendError(message, "exception thrown when attempting to drop collection: " + collection + " \n" + mongoException.getMessage());
-    }
+    return mongo.dropCollection(collection)
+      .onFailure(th -> sendError(message, "exception thrown when attempting to drop collection: " + collection + "\n" + th.getMessage(), th))
+      .onSuccess(e -> sendOK(message, new JsonObject()));
   }
 
-  private void getCollectionStats(Message<JsonObject> message) {
-    String collection = getMandatoryString("collection", message);
-
+  private Future<Void> getCollectionStats(Message<JsonObject> message) {
+    final String collection = getMandatoryString("collection", message);
     if (collection == null) {
-      return;
+      return Future.failedFuture("collection.name.mandatory");
     }
-
-    DBCollection coll = db.getCollection(collection);
-    CommandResult stats = coll.getStats();
-
-    JsonObject reply = new JsonObject();
-    reply.put("stats", dbObjectToJsonObject(stats));
-    sendOK(message, reply);
-
+    return mongo.runCommand("collStats", new JsonObject().put("collStats", collection))
+      .onFailure(th -> sendError(message, th))
+      .onSuccess(stats -> {
+        final JsonObject reply = new JsonObject().put("stats", stats);
+        sendOK(message, reply);
+      })
+      .mapEmpty();
   }
 
-  private void doAggregation(Message<JsonObject> message) {
+  private Future<Void> doAggregation(Message<JsonObject> message) {
     if (isCollectionMissing(message)) {
-      sendError(message, "collection is missing");
-      return;
+      return Future.failedFuture("collection.name.mandatory");
     }
     if (isPipelinesMissing(message.body().getJsonArray("pipelines"))) {
       sendError(message, "no pipeline operations found");
-      return;
+      return Future.failedFuture("pipelines.mandatory");
     }
-    String collection = getMandatoryString("collection", message);
-    JsonArray pipelinesAsJson = message.body().getJsonArray("pipelines");
-    List<DBObject> pipelines = jsonPipelinesToDbObjects(pipelinesAsJson);
-
-    DBCollection dbCollection = db.getCollection(collection);
-    // v2.11.1 of the driver has an inefficient method signature in terms
-    // of parameters, so we have to remove the first one
-    DBObject firstPipelineOp = pipelines.remove(0);
-    AggregationOutput aggregationOutput = dbCollection.aggregate(firstPipelineOp, pipelines.toArray(new DBObject[] {}));
-
-    JsonArray results = new JsonArray();
-    for (DBObject dbObject : aggregationOutput.results()) {
-      results.add(dbObjectToJsonObject(dbObject));
-    }
-
-    JsonObject reply = new JsonObject();
-    reply.put("results", results);
-    sendOK(message, reply);
-  }
-
-  private List<DBObject> jsonPipelinesToDbObjects(JsonArray pipelinesAsJson) {
-    List<DBObject> pipelines = new ArrayList<>();
-    for (Object pipeline : pipelinesAsJson) {
-      DBObject dbObject = jsonToDBObject((JsonObject) pipeline);
-      pipelines.add(dbObject);
-    }
-    return pipelines;
-  }
-
-  /**
-   * Retrieve replica set write concern according to its priority
-   * - first from the message query if specified
-   * - then from the config if present
-   * - then from the config (backwards compatibility) if present
-   * - otherwise from the database
-   * @param message the message containing the mongo query
-   * @return the write concern
-   */
-  private WriteConcern getWriteConcernWithPriority(Message<JsonObject> message) {
-    // Get WriteConcern at query level
-    return parseWriteConcern(message.body().getString("write_concern", ""))
-            // Get WriteConcern at config level
-            .orElse(parseWriteConcern(getOptionalStringConfig("writeConcern", ""))
-                    // Get WriteConcern at config level - backwards compatibility
-                    .orElse(parseWriteConcern(getOptionalStringConfig("write_concern", ""))
-                            // Get WriteConcern at database level
-                            .orElse(db.getWriteConcern())));
-  }
-
-  /**
-   * Parse and retrieve WriteConcern
-   * @param writeConcernField write concern field from config
-   * @return Optional WriteConcern, empty when Write Concern cannot be parsed
-   */
-  private Optional<WriteConcern> parseWriteConcern(String writeConcernField) {
-    Optional<WriteConcern> writeConcern = Optional.ofNullable(WriteConcern.valueOf(writeConcernField));
-    if (StringUtils.isNotEmpty(writeConcernField) && !writeConcern.isPresent()) {
-      logger.warn("Specified write concern field is invalid : " + writeConcernField);
-    }
-    return writeConcern;
+    final String collection = message.body().getString("collection");
+    final JsonArray pipelines = message.body().getJsonArray("pipelines");
+    final ReadStream<JsonObject> stream = mongo.aggregate(collection, pipelines);
+    final Promise<Void> promise = Promise.promise();
+    final JsonArray results = new JsonArray();
+    stream.endHandler(e -> {
+      JsonObject reply = new JsonObject();
+      reply.put("results", results);
+      sendOK(message, reply);
+      promise.complete();
+    })
+    .handler(results::add)
+    .exceptionHandler(th -> {
+      sendError(message, th);
+      mongo.close();
+    });
+    return promise.future();
   }
 
   private boolean isCollectionMissing(Message<JsonObject> message) {
@@ -749,50 +620,33 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     return pipelines == null || pipelines.size() == 0;
   }
 
-  private void runCommand(Message<JsonObject> message) {
+  private Future<Void> runCommand(Message<JsonObject> message) {
     JsonObject reply = new JsonObject();
-
-    String command = getMandatoryString("command", message);
-
-    if (command == null) {
-      return;
+    final String commandRaw = getMandatoryString("command", message);
+    if (commandRaw == null) {
+      return Future.failedFuture("command.mandatory");
     }
-
-    DBObject commandObject = MongoUtil.convertJsonToBson(command);
-    CommandResult result = db.command(commandObject);
-    Map<String,Object> resultMap = result.toMap();
-    //BSONTimestamp cannot be serialized => only for replica set
-    resultMap.remove("operationTime");
-    resultMap.remove("$clusterTime");
-    resultMap.remove("opTime");
-    resultMap.remove("electionId");
-    //
-    reply.put("result", new JsonObject(resultMap));
-    sendOK(message, reply);
-  }
-
-  private JsonObject dbObjectToJsonObject(DBObject obj) {
-    if (useMongoTypes) {
-      return MongoUtil.convertBsonToJson(obj);
-    } else {
-      return new JsonObject(obj.toMap());
+    try {
+      final JsonObject command = new JsonObject(commandRaw);
+      return getCommandName(command).map(commandName -> mongo.runCommand(commandName, command)
+          .onFailure(th -> sendError(message, th))
+          .onSuccess(result -> {
+            result.remove("operationTime");
+            result.remove("$clusterTime");
+            result.remove("opTime");
+            result.remove("electionId");
+            reply.put("result", result);
+            sendOK(message, reply);
+          })).orElseGet(() -> Future.failedFuture("command.name.mandatory"))
+        .mapEmpty();
+    } catch (Exception th) {
+      sendError(message, th);
+      return Future.failedFuture(th);
     }
   }
 
-  private DBObject jsonToDBObject(JsonObject object) {
-    if (useMongoTypes) {
-      return MongoUtil.convertJsonToBson(object);
-    } else {
-      return new BasicDBObject(object.getMap());
-    }
-  }
-
-  private DBObject jsonToDBObjectNullSafe(JsonObject object) {
-    if (object != null) {
-      return jsonToDBObject(object);
-    } else {
-      return null;
-    }
+  private Optional<String> getCommandName(final JsonObject command) {
+    return command.fieldNames().stream().findFirst();
   }
 
 }
