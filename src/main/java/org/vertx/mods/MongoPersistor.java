@@ -422,6 +422,12 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     Object hint = message.body().getValue("hint");
     Object sort = message.body().getValue("sort");
     DBCollection coll = db.getCollection(collection);
+    // add read preference
+    final String overrideReadPreference = message.body().getString("read_preference");
+    if(overrideReadPreference != null){
+      coll.setReadPreference(ReadPreference.valueOf(overrideReadPreference));
+    }
+    // call find
     DBCursor cursor;
     if (matcher != null) {
       cursor = (keys == null) ?
@@ -501,6 +507,12 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     JsonObject matcher = message.body().getJsonObject("matcher");
     JsonObject keys = message.body().getJsonObject("keys");
     DBCollection coll = db.getCollection(collection);
+    // add read preference
+    final String overrideReadPreference = message.body().getString("read_preference");
+    if(overrideReadPreference != null){
+      coll.setReadPreference(ReadPreference.valueOf(overrideReadPreference));
+    }
+    // call find
     DBObject res;
     if (matcher == null) {
       res = keys != null ? coll.findOne(null, jsonToDBObject(keys)) : coll.findOne();
@@ -562,6 +574,12 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     }
     JsonObject matcher = message.body().getJsonObject("matcher");
     DBCollection coll = db.getCollection(collection);
+    // add read preference
+    final String overrideReadPreference = message.body().getString("read_preference");
+    if(overrideReadPreference != null){
+      coll.setReadPreference(ReadPreference.valueOf(overrideReadPreference));
+    }
+    // call find
     long count;
     if (matcher == null) {
       count = coll.count();
