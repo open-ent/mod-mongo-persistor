@@ -17,7 +17,6 @@
 package org.vertx.mods;
 
 import com.mongodb.*;
-import com.mongodb.util.JSON;
 
 import io.vertx.core.Handler;
 import io.vertx.core.eventbus.Message;
@@ -27,10 +26,7 @@ import org.vertx.java.busmods.BusModBase;
 
 import javax.net.ssl.SSLSocketFactory;
 import java.net.UnknownHostException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
 
 /**
  * MongoDB Persistor Bus Module<p>
@@ -209,14 +205,7 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     String genID = generateId(doc);
     DBCollection coll = db.getCollection(collection);
     DBObject obj = jsonToDBObject(doc);
-    WriteConcern writeConcern = WriteConcern.valueOf(getOptionalStringConfig("writeConcern", ""));
-    // Backwards compatibility
-    if (writeConcern == null) {
-      writeConcern = WriteConcern.valueOf(getOptionalStringConfig("write_concern", ""));
-    }
-    if (writeConcern == null) {
-      writeConcern = db.getWriteConcern();
-    }
+    WriteConcern writeConcern = getWriteConcernWithPriority(message);
     try {
       WriteResult res = coll.save(obj, writeConcern);
       if (genID != null) {
@@ -306,15 +295,7 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     Boolean upsert = message.body().getBoolean("upsert", false);
     Boolean multi = message.body().getBoolean("multi", false);
     DBCollection coll = db.getCollection(collection);
-    WriteConcern writeConcern = WriteConcern.valueOf(getOptionalStringConfig("writeConcern", ""));
-    // Backwards compatibility
-    if (writeConcern == null) {
-      writeConcern = WriteConcern.valueOf(getOptionalStringConfig("write_concern", ""));
-    }
-
-    if (writeConcern == null) {
-      writeConcern = db.getWriteConcern();
-    }
+    WriteConcern writeConcern = getWriteConcernWithPriority(message);
     try {
       WriteResult res = coll.update(criteria, objNew, upsert, multi, writeConcern);
       JsonObject reply = new JsonObject();
@@ -625,15 +606,7 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     }
     DBCollection coll = db.getCollection(collection);
     DBObject obj = jsonToDBObject(matcher);
-    WriteConcern writeConcern = WriteConcern.valueOf(getOptionalStringConfig("writeConcern", ""));
-    // Backwards compatibility
-    if (writeConcern == null) {
-      writeConcern = WriteConcern.valueOf(getOptionalStringConfig("write_concern", ""));
-    }
-
-    if (writeConcern == null) {
-      writeConcern = db.getWriteConcern();
-    }
+    WriteConcern writeConcern = getWriteConcernWithPriority(message);
     WriteResult res = coll.remove(obj, writeConcern);
     int deleted = res.getN();
     JsonObject reply = new JsonObject().put("number", deleted);
@@ -717,6 +690,39 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
       pipelines.add(dbObject);
     }
     return pipelines;
+  }
+
+  /**
+   * Retrieve replica set write concern according to its priority
+   * - first from the message query if specified
+   * - then from the config if present
+   * - then from the config (backwards compatibility) if present
+   * - otherwise from the database
+   * @param message the message containing the mongo query
+   * @return the write concern
+   */
+  private WriteConcern getWriteConcernWithPriority(Message<JsonObject> message) {
+    // Get WriteConcern at query level
+    return parseWriteConcern(message.body().getString("write_concern", ""))
+            // Get WriteConcern at config level
+            .orElse(parseWriteConcern(getOptionalStringConfig("writeConcern", ""))
+                    // Get WriteConcern at config level - backwards compatibility
+                    .orElse(parseWriteConcern(getOptionalStringConfig("write_concern", ""))
+                            // Get WriteConcern at database level
+                            .orElse(db.getWriteConcern())));
+  }
+
+  /**
+   * Parse and retrieve WriteConcern
+   * @param writeConcernField write concern field from config
+   * @return Optional WriteConcern, empty when Write Concern cannot be parsed
+   */
+  private Optional<WriteConcern> parseWriteConcern(String writeConcernField) {
+    Optional<WriteConcern> writeConcern = Optional.ofNullable(WriteConcern.valueOf(writeConcernField));
+    if (!writeConcern.isPresent()) {
+      logger.warn("Write concern field is invalid : " + writeConcernField);
+    }
+    return writeConcern;
   }
 
   private boolean isCollectionMissing(Message<JsonObject> message) {
