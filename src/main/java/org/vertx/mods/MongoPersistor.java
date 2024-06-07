@@ -22,6 +22,7 @@ import io.vertx.core.Handler;
 import io.vertx.core.eventbus.Message;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
+import org.apache.commons.lang3.StringUtils;
 import org.vertx.java.busmods.BusModBase;
 
 import javax.net.ssl.SSLSocketFactory;
@@ -719,8 +720,8 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
    */
   private Optional<WriteConcern> parseWriteConcern(String writeConcernField) {
     Optional<WriteConcern> writeConcern = Optional.ofNullable(WriteConcern.valueOf(writeConcernField));
-    if (!writeConcern.isPresent()) {
-      logger.warn("Write concern field is invalid : " + writeConcernField);
+    if (StringUtils.isNotEmpty(writeConcernField) && !writeConcern.isPresent()) {
+      logger.warn("Specified write concern field is invalid : " + writeConcernField);
     }
     return writeConcern;
   }
