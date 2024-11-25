@@ -11,10 +11,10 @@
 
   <groupId>io.vertx</groupId>
   <artifactId>mod-mongo-persistor</artifactId>
-  <version>4.0-b2school-SNAPSHOT</version>
+  <version>4.0-SNAPSHOT</version>
 
   <properties>
-    <web-utils.version>3.0-b2school-SNAPSHOT</web-utils.version>
+    <web-utils.version>3.0-SNAPSHOT</web-utils.version>
     <jacksonDatabindVersion>2.15.2</jacksonDatabindVersion>
     <mongo.version>4.8.1</mongo.version>
   </properties>
