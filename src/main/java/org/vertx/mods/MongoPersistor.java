@@ -26,6 +26,7 @@ import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.core.streams.ReadStream;
 import io.vertx.ext.mongo.*;
+import org.apache.commons.lang3.StringUtils;
 import org.vertx.java.busmods.BusModBase;
 
 import java.util.*;
@@ -518,11 +519,15 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
       return Future.failedFuture("collection.key.mandatory");
     }
     final JsonObject matcher = message.body().getJsonObject("matcher");
+    String className = message.body().getString("resultClassname");
+    if(StringUtils.isBlank(className)) {
+      className = String.class.getName();
+    }
     final Future<JsonArray> future;
     if(matcher == null) {
-      future = mongo.distinct(collection, key, String.class.getName());
+      future = mongo.distinct(collection, key, className);
     } else {
-      future = mongo.distinctWithQuery(collection, key, String.class.getName(), matcher);
+      future = mongo.distinctWithQuery(collection, key, className, matcher);
     }
     return future.
       onFailure(th -> sendError(message, th.getMessage(), th))
