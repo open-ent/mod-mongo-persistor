@@ -11,7 +11,7 @@
 
   <groupId>io.vertx</groupId>
   <artifactId>mod-mongo-persistor</artifactId>
-  <version>4.0.0</version>
+  <version>4.0.1</version>
 
   <properties>
     <web-utils.version>3.0.0</web-utils.version>
