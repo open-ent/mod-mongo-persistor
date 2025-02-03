@@ -4,9 +4,9 @@
   <modelVersion>4.0.0</modelVersion>
 
   <parent>
-    <groupId>io.edifice</groupId>
-    <artifactId>app-parent</artifactId>
-    <version>1.0</version>
+    <groupId>org.openent</groupId>
+    <artifactId>modules</artifactId>
+    <version>1.0-SNAPSHOT</version>
   </parent>
 
   <groupId>io.vertx</groupId>
@@ -14,9 +14,9 @@
   <version>4.0.1</version>
 
   <properties>
-    <web-utils.version>3.0.0</web-utils.version>
     <jacksonDatabindVersion>2.15.2</jacksonDatabindVersion>
     <mongo.version>4.8.1</mongo.version>
+    <mongodb.driver.reactivestreams.version>4.8.1</mongodb.driver.reactivestreams.version>
   </properties>
 
   <scm>
@@ -57,7 +57,5 @@
       <artifactId>vertx-mongo-client</artifactId>
       <version>${vertxVersion}</version>
     </dependency>
-
-
   </dependencies>
 </project>
